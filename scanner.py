@@ -1,222 +1,154 @@
-import os
-import re
+   mainimport os
 import smtplib
-from datetime import datetime
-from email.mime.multipart import MIMEMultipart
+from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
-from zoneinfo import ZoneInfo
-
-import pandas as pd
-import requests
+from email.mime.multipart import MIMEMultipart
 import yfinance as yf
-from bs4 import BeautifulSoup
 
-# ====== ตั้งค่าเกณฑ์การสแกน (ปรับแก้ตัวเลขได้ตามต้องการ) ======
-MIN_CHANGE_PCT = 2.0      # บวกขั้นต่ำกี่ % ขึ้นไป (เช่น 2.0 = +2%)
-MIN_VOL_RATIO = 1.5       # วอลุ่มวันนี้เป็นกี่เท่าของค่าเฉลี่ย 20 วัน (เช่น 1.5 เท่า)
-SEND_EMAIL = True         # ตั้งเป็น False หากต้องการเทสต์รันดูผลใน Log ก่อนส่งเมลจริง
-AUTO_FETCH_TICKERS = True # ตั้งเป็น True เพื่อให้ดึงรายชื่อหุ้นอัตโนมัติโดยไม่ต้องแก้ไฟล์เอง
-
-# ลิสต์สำรองหุ้นเด่น 50 ตัว (ใช้กรณีดึงข้อมูลสดจากเว็บไม่สำเร็จ)
+# รายชื่อหุ้นไทย 50 ตัว (ปรับให้ทันสมัยและไม่ติดหุ้นที่ถูกลิสต์ออก)
 FALLBACK_SET50_TICKERS = [
     "ADVANC.BK", "AOT.BK", "AWC.BK", "BANPU.BK", "BBL.BK",
     "BDMS.BK", "BEM.BK", "BGRIM.BK", "BH.BK", "BJC.BK",
     "BTS.BK", "CBG.BK", "CENTEL.BK", "COM7.BK", "CPALL.BK",
     "CPF.BK", "CPN.BK", "CRC.BK", "DELTA.BK", "EA.BK",
     "EGCO.BK", "GLOBAL.BK", "GPSC.BK", "GULF.BK", "HMPRO.BK",
-    "INTUCH.BK", "IVL.BK", "KBANK.BK", "KCE.BK", "KTB.BK",
+    "IVL.BK", "KBANK.BK", "KCE.BK", "KKP.BK", "KTB.BK",
     "KTC.BK", "LH.BK", "MINT.BK", "MTC.BK", "OR.BK",
-    "OSP.BK", "PTT.BK", "PTTEP.BK", "RATCH.BK", "SAWAD.BK",
-    "SCB.BK", "SCC.BK", "SCGP.BK", "SPRC.BK", "STA.BK",
-    "TIDLOR.BK", "TISCO.BK", "TOP.BK", "TRUE.BK", "TTB.BK",
+    "OSP.BK", "PTT.BK", "PTTEP.BK", "PTTGC.BK", "RATCH.BK",
+    "SAWAD.BK", "SCB.BK", "SCC.BK", "SCGP.BK", "SIRI.BK",
+    "TISCO.BK", "TLI.BK", "TOP.BK", "TRUE.BK", "TTB.BK"
 ]
 
-# ใส่วันหยุดตลาดหลักทรัพย์ฯ เพิ่มเติมได้ในรูปแบบ "YYYY-MM-DD"
-THAI_HOLIDAYS = {
-    "2026-01-01", "2026-01-02", "2026-03-03", "2026-04-06",
-    "2026-04-13", "2026-04-14", "2026-04-15", "2026-05-01",
-    "2026-05-04", "2026-06-01", "2026-06-03", "2026-07-28",
-    "2026-08-12", "2026-10-13", "2026-10-23", "2026-12-07",
-    "2026-12-31",
-}
+def get_thai_time():
+    tz_bkk = timezone(timedelta(hours=7))
+    return datetime.now(tz_bkk)
 
+def is_thai_market_day(now_bkk):
+    # 0=จันทร์ ... 4=ศุกร์, 5=เสาร์, 6=อาทิตย์
+    return now_bkk.weekday() < 5
 
-def is_thai_market_open(now_bkk: datetime) -> tuple[bool, str]:
-    date_str = now_bkk.strftime("%Y-%m-%d")
-    if now_bkk.weekday() >= 5:
-        return False, "วันนี้เป็นวันหยุดสุดสัปดาห์ (เสาร์-อาทิตย์)"
-    if date_str in THAI_HOLIDAYS:
-        return False, f"วันนี้เป็นวันหยุดตลาดหลักทรัพย์ฯ ({date_str})"
+def fetch_stock_summary(tickers, batch_size=50):
+    results = []
+    # แบ่งสแกนเป็นชุดละ 50 ตัว
+    for i in range(0, len(tickers), batch_size):
+        batch = tickers[i:i + batch_size]
+        print(f"[INFO] กำลังดึงข้อมูลชุดที่ {i // batch_size + 1} ({len(batch)} ตัว)...")
+        data = yf.download(batch, period="5d", interval="1d", group_by="ticker", progress=False)
 
-    current_minutes = now_bkk.hour * 60 + now_bkk.minute
-    morning_start = 10 * 60         # 10:00
-    morning_end = 12 * 60 + 30      # 12:30
-    afternoon_start = 14 * 60 + 30  # 14:30
-    afternoon_end = 16 * 60 + 30    # 16:30
+        for ticker in batch:
+            try:
+                df = data[ticker] if len(batch) > 1 else data
+                df = df.dropna(subset=["Close", "Open"])
+                if len(df) < 1:
+                    continue
 
-    in_morning = morning_start <= current_minutes <= morning_end
-    in_afternoon = afternoon_start <= current_minutes <= afternoon_end
+                latest = df.iloc[-1]
+                open_price = float(latest["Open"])
+                close_price = float(latest["Close"])
 
-    if in_morning or in_afternoon:
-        return True, "ตลาดหุ้นไทยเปิดทำการอยู่"
-    return False, f"นอกเวลาเปิดตลาดหุ้นไทย (เวลาไทยปัจจุบัน {now_bkk.strftime('%H:%M')})"
+                # เทียบกับราคาปิดเมื่อวาน (ถ้ามี) หรือเทียบกับราคาเปิดวันนี้
+                if len(df) >= 2:
+                    prev_close = float(df.iloc[-2]["Close"])
+                else:
+                    prev_close = open_price
 
+                diff_from_open = close_price - open_price
+                pct_from_open = (diff_from_open / open_price * 100) if open_price > 0 else 0.0
 
-def fetch_auto_tickers() -> list[str]:
-    """ดึงรายชื่อหุ้น SET50 อัตโนมัติจากแหล่งข้อมูลออนไลน์ พร้อมระบบสำรอง"""
-    urls = [
-        "https://www.set.or.th/en/market/index/set50/overview",
-        "https://stockanalysis.com/list/set50-stocks/",
-    ]
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        )
-    }
+                diff_from_prev = close_price - prev_close
+                pct_from_prev = (diff_from_prev / prev_close * 100) if prev_close > 0 else 0.0
 
-    for url in urls:
-        try:
-            resp = requests.get(url, headers=headers, timeout=15)
-            if resp.status_code != 200:
-                continue
-
-            soup = BeautifulSoup(resp.text, "html.parser")
-            found: list[str] = []
-
-            for a_tag in soup.find_all("a", href=True):
-                href = a_tag["href"]
-                text = a_tag.get_text(strip=True).upper()
-                if re.fullmatch(r"[A-Z0-9]{1,8}", text) and (
-                    "/quote/" in href.lower() or "/stocks/" in href.lower()
-                ):
-                    symbol = f"{text}.BK"
-                    if symbol not in found:
-                        found.append(symbol)
-
-            if len(found) >= 20:
-                print(f"[AUTO] ดึงรายชื่อหุ้นอัตโนมัติสำเร็จจาก {url} ({len(found)} ตัว)")
-                return found[:50]
-        except Exception as e:
-            print(f"[WARN] ดึงรายชื่ออัตโนมัติจาก {url} ไม่สำเร็จ: {e}")
-
-    print(f"[AUTO] ใช้ลิสต์หุ้นสำรองอัตโนมัติ ({len(FALLBACK_SET50_TICKERS)} ตัว)")
-    return list(FALLBACK_SET50_TICKERS)
-
-
-def load_tickers(filepath: str = "tickers.txt") -> list[str]:
-    if AUTO_FETCH_TICKERS:
-        return fetch_auto_tickers()
-
-    if not os.path.exists(filepath):
-        return []
-    with open(filepath, "r", encoding="utf-8") as f:
-        return [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
-
-
-def scan_stocks(tickers: list[str]) -> list[dict]:
-    alerts = []
-    for ticker in tickers:
-        try:
-            df = yf.download(ticker, period="35d", interval="1d", progress=False, auto_adjust=False)
-            if df is None or len(df) < 22:
-                continue
-
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-
-            df = df.dropna(subset=["Close", "Volume"])
-            if len(df) < 22:
-                continue
-
-            prev_close = float(df["Close"].iloc[-2])
-            latest_close = float(df["Close"].iloc[-1])
-            latest_vol = float(df["Volume"].iloc[-1])
-            avg_vol_20 = float(df["Volume"].iloc[-21:-1].mean())
-
-            if prev_close <= 0 or avg_vol_20 <= 0:
-                continue
-
-            change_pct = ((latest_close - prev_close) / prev_close) * 100.0
-            vol_ratio = latest_vol / avg_vol_20
-
-            if change_pct >= MIN_CHANGE_PCT and vol_ratio >= MIN_VOL_RATIO:
-                alerts.append({
-                    "ticker": ticker,
-                    "price": round(latest_close, 2),
-                    "change_pct": round(change_pct, 2),
-                    "vol_ratio": round(vol_ratio, 2),
+                symbol_clean = ticker.replace(".BK", "")
+                results.append({
+                    "symbol": symbol_clean,
+                    "open": open_price,
+                    "current": close_price,
+                    "diff_open": diff_from_open,
+                    "pct_open": pct_from_open,
+                    "pct_prev": pct_from_prev,
                 })
-        except Exception as e:
-            print(f"[WARN] ดึงข้อมูล {ticker} ไม่สำเร็จ: {e}")
+            except Exception as e:
+                print(f"[WARN] ข้าม {ticker}: {e}")
+    return results
 
-    alerts.sort(key=lambda x: x["change_pct"], reverse=True)
-    return alerts
+def send_gmail_report(subject, body_text):
+    gmail_user = os.environ.get("GMAIL_USER")
+    gmail_pass = os.environ.get("GMAIL_APP_PASSWORD")
+    gmail_to = os.environ.get("GMAIL_TO") or gmail_user
 
-
-def send_gmail_alert(alerts: list[dict], now_bkk: datetime) -> None:
-    sender_email = os.environ.get("GMAIL_USER", "").strip()
-    app_password = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
-    receiver_email = os.environ.get("GMAIL_TO", sender_email).strip()
-
-    if not sender_email or not app_password:
-        print("[INFO] ยังไม่ได้ตั้งค่า GMAIL_USER หรือ GMAIL_APP_PASSWORD ข้ามการส่งอีเมล")
+    if not gmail_user or not gmail_pass:
+        print("[ERROR] ไม่พบค่า GMAIL_USER หรือ GMAIL_APP_PASSWORD ใน GitHub Secrets")
         return
-
-    subject = f"[SET Scanner] พบหุ้นเข้าเกณฑ์ {len(alerts)} ตัว ({now_bkk.strftime('%H:%M')} น.)"
-    lines = [
-        f"เวลาไทย: {now_bkk.strftime('%Y-%m-%d %H:%M:%S')}",
-        f"เกณฑ์สแกน: บวก >= {MIN_CHANGE_PCT}% และ วอลุ่ม >= {MIN_VOL_RATIO}x ของค่าเฉลี่ย 20 วัน",
-        "-" * 45,
-    ]
-    for item in alerts:
-        lines.append(
-            f"• {item['ticker']} | ราคา: {item['price']} | "
-            f"เปลี่ยนแปลง: +{item['change_pct']}% | วอลุ่ม: {item['vol_ratio']}x"
-        )
-
-    body = "\n".join(lines)
 
     msg = MIMEMultipart()
-    msg["From"] = sender_email
-    msg["To"] = receiver_email
+    msg["From"] = gmail_user
+    msg["To"] = gmail_to
     msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain", "utf-8"))
+    msg.attach(MIMEText(body_text, "plain", "utf-8"))
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(sender_email, app_password)
-        server.send_message(msg)
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(gmail_user, gmail_pass)
+            server.sendmail(gmail_user, gmail_to, msg.as_string())
+        print(f"[SUCCESS] ส่งอีเมลรายงานไปยัง {gmail_to} เรียบร้อยแล้ว!")
+    except Exception as e:
+        print(f"[ERROR] ส่งอีเมลไม่สำเร็จ: {e}")
 
-    print("[SUCCESS] ส่งแจ้งเตือนเข้า Gmail เรียบร้อยแล้ว")
+def main():
+    now_bkk = get_thai_time()
+    event_name = os.environ.get("GITHUB_EVENT_NAME", "manual")
+    time_str = now_bkk.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[TIME] {time_str} (Asia/Bangkok) | Trigger: {event_name}")
 
-
-def main() -> None:
-    now_bkk = datetime.now(ZoneInfo("Asia/Bangkok"))
-    is_open, reason = is_thai_market_open(now_bkk)
-    print(f"[TIME] {now_bkk.strftime('%Y-%m-%d %H:%M:%S')} (Asia/Bangkok) -> {reason}")
-
-    force_run = os.environ.get("FORCE_RUN", "false").lower() == "true"
-    if not is_open and not force_run:
+    # ถ้าเป็นการรันอัตโนมัติตามเวลา ให้ข้ามวันเสาร์-อาทิตย์
+    if event_name == "schedule" and not is_thai_market_day(now_bkk):
+        print("[INFO] วันเสาร์-อาทิตย์ ตลาดหุ้นไทยปิดทำการ ข้ามการส่งอีเมล")
         return
 
-    tickers = load_tickers("tickers.txt")
-    print(f"[INFO] จำนวนหุ้นในลิสต์: {len(tickers)} ตัว")
-    if not tickers:
+    # ระบุรอบเวลา (รอบเช้า หรือ รอบเย็น)
+    if now_bkk.hour < 13:
+        session_label = "รอบเช้า (ตลาดเปิด)"
+    else:
+        session_label = "รอบเย็น (สรุป/ใกล้ปิดตลาด)"
+
+    print(f"[AUTO] กำลังสแกนหุ้นทั้งหมด {len(FALLBACK_SET50_TICKERS)} ตัว ({session_label})")
+    stocks = fetch_stock_summary(FALLBACK_SET50_TICKERS, batch_size=50)
+
+    if not stocks:
+        print("[WARN] ไม่สามารถดึงข้อมูลราคาหุ้นได้ในรอบนี้")
         return
 
-    results = scan_stocks(tickers)
-    if not results:
-        print("[INFO] รอบนี้ยังไม่มีหุ้นตัวไหนผ่านเกณฑ์")
-        return
+    # สร้างข้อความรายงานสรุปครบทั้ง 50 ตัว
+    lines = [
+        f"รายงานราคาหุ้นไทย ({session_label})",
+        f"เวลาสแกน: {time_str} (เวลาไทย)",
+        f"จำนวนหุ้นที่ดึงข้อมูลได้: {len(stocks)} ตัว",
+        "=" * 48,
+        "ชื่อหุ้น | ราคาเปิดเช้า | ราคาล่าสุด/ปิด | เทียบเปิด | เทียบเมื่อวาน",
+        "-" * 48,
+    ]
 
-    print(f"[ALERT] หุ้นที่ผ่านเกณฑ์ ({len(results)} ตัว):")
-    for r in results:
-        print(f"  - {r['ticker']}: ราคา {r['price']} (+{r['change_pct']}%), วอลุ่ม {r['vol_ratio']}x")
+    for s in stocks:
+        sign_open = "+" if s["diff_open"] >= 0 else ""
+        sign_prev = "+" if s["pct_prev"] >= 0 else ""
+        line = (
+            f"{s['symbol']:<7} | "
+            f"เปิด: {s['open']:>7.2f} | "
+            f"ล่าสุด: {s['current']:>7.2f} | "
+            f"({sign_open}{s['pct_open']:.2f}%) | "
+            f"วันก่อน: {sign_prev}{s['pct_prev']:.2f}%"
+        )
+        lines.append(line)
 
-    if SEND_EMAIL:
-        send_gmail_alert(results, now_bkk)
+    lines.append("=" * 48)
+    report_body = "\n".join(lines)
 
+    # พิมพ์ลง Log บน GitHub ด้วย
+    print(report_body)
+
+    # ส่งเข้า Gmail ทุกครั้งที่รันเสร็จ
+    subject = f"[SET50] รายงานราคาหุ้น 50 ตัว - {session_label} ({now_bkk.strftime('%d/%m/%Y')})"
+    send_gmail_report(subject, report_body)
 
 if __name__ == "__main__":
-    main()
+()
