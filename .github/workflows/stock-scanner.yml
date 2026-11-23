@@ -1,10 +1,12 @@
 name: Thai Stock Scanner
 
 on:
-  schedule:
-    - cron: '0 2 * * 1-5'
-    - cron: '0 7 * * 1-5'
   workflow_dispatch:
+  schedule:
+    # รอบเช้า: 03:15 UTC = 10:15 น. เวลาไทย (หลังตลาดเปิดเช้า 10:00 น.) จันทร์-ศุกร์
+    - cron: '15 3 * * 1-5'
+    # รอบเย็น: 09:40 UTC = 16:40 น. เวลาไทย (หลังตลาดปิดเย็น 16:30 น.) จันทร์-ศุกร์
+    - cron: '40 9 * * 1-5'
 
 jobs:
   scan:
@@ -20,9 +22,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install requests pandas yfinance
+          pip install --upgrade pip
+          pip install yfinance pandas
 
       - name: Run Thai stock scanner
         env:
