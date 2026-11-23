@@ -1,4 +1,4 @@
-   mainimport os
+import os
 import smtplib
 from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
@@ -151,4 +151,4 @@ def main():
     send_gmail_report(subject, report_body)
 
 if __name__ == "__main__":
-()
+    main()
