@@ -1,4 +1,5 @@
 import os
+import re
 import smtplib
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
@@ -6,12 +7,29 @@ from email.mime.text import MIMEText
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import requests
 import yfinance as yf
+from bs4 import BeautifulSoup
 
 # ====== ตั้งค่าเกณฑ์การสแกน (ปรับแก้ตัวเลขได้ตามต้องการ) ======
 MIN_CHANGE_PCT = 2.0      # บวกขั้นต่ำกี่ % ขึ้นไป (เช่น 2.0 = +2%)
 MIN_VOL_RATIO = 1.5       # วอลุ่มวันนี้เป็นกี่เท่าของค่าเฉลี่ย 20 วัน (เช่น 1.5 เท่า)
 SEND_EMAIL = True         # ตั้งเป็น False หากต้องการเทสต์รันดูผลใน Log ก่อนส่งเมลจริง
+AUTO_FETCH_TICKERS = True # ตั้งเป็น True เพื่อให้ดึงรายชื่อหุ้นอัตโนมัติโดยไม่ต้องแก้ไฟล์เอง
+
+# ลิสต์สำรองหุ้นเด่น 50 ตัว (ใช้กรณีดึงข้อมูลสดจากเว็บไม่สำเร็จ)
+FALLBACK_SET50_TICKERS = [
+    "ADVANC.BK", "AOT.BK", "AWC.BK", "BANPU.BK", "BBL.BK",
+    "BDMS.BK", "BEM.BK", "BGRIM.BK", "BH.BK", "BJC.BK",
+    "BTS.BK", "CBG.BK", "CENTEL.BK", "COM7.BK", "CPALL.BK",
+    "CPF.BK", "CPN.BK", "CRC.BK", "DELTA.BK", "EA.BK",
+    "EGCO.BK", "GLOBAL.BK", "GPSC.BK", "GULF.BK", "HMPRO.BK",
+    "INTUCH.BK", "IVL.BK", "KBANK.BK", "KCE.BK", "KTB.BK",
+    "KTC.BK", "LH.BK", "MINT.BK", "MTC.BK", "OR.BK",
+    "OSP.BK", "PTT.BK", "PTTEP.BK", "RATCH.BK", "SAWAD.BK",
+    "SCB.BK", "SCC.BK", "SCGP.BK", "SPRC.BK", "STA.BK",
+    "TIDLOR.BK", "TISCO.BK", "TOP.BK", "TRUE.BK", "TTB.BK",
+]
 
 # ใส่วันหยุดตลาดหลักทรัพย์ฯ เพิ่มเติมได้ในรูปแบบ "YYYY-MM-DD"
 THAI_HOLIDAYS = {
@@ -44,7 +62,53 @@ def is_thai_market_open(now_bkk: datetime) -> tuple[bool, str]:
     return False, f"นอกเวลาเปิดตลาดหุ้นไทย (เวลาไทยปัจจุบัน {now_bkk.strftime('%H:%M')})"
 
 
+def fetch_auto_tickers() -> list[str]:
+    """ดึงรายชื่อหุ้น SET50 อัตโนมัติจากแหล่งข้อมูลออนไลน์ พร้อมระบบสำรอง"""
+    urls = [
+        "https://www.set.or.th/en/market/index/set50/overview",
+        "https://stockanalysis.com/list/set50-stocks/",
+    ]
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        )
+    }
+
+    for url in urls:
+        try:
+            resp = requests.get(url, headers=headers, timeout=15)
+            if resp.status_code != 200:
+                continue
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+            found: list[str] = []
+
+            for a_tag in soup.find_all("a", href=True):
+                href = a_tag["href"]
+                text = a_tag.get_text(strip=True).upper()
+                if re.fullmatch(r"[A-Z0-9]{1,8}", text) and (
+                    "/quote/" in href.lower() or "/stocks/" in href.lower()
+                ):
+                    symbol = f"{text}.BK"
+                    if symbol not in found:
+                        found.append(symbol)
+
+            if len(found) >= 20:
+                print(f"[AUTO] ดึงรายชื่อหุ้นอัตโนมัติสำเร็จจาก {url} ({len(found)} ตัว)")
+                return found[:50]
+        except Exception as e:
+            print(f"[WARN] ดึงรายชื่ออัตโนมัติจาก {url} ไม่สำเร็จ: {e}")
+
+    print(f"[AUTO] ใช้ลิสต์หุ้นสำรองอัตโนมัติ ({len(FALLBACK_SET50_TICKERS)} ตัว)")
+    return list(FALLBACK_SET50_TICKERS)
+
+
 def load_tickers(filepath: str = "tickers.txt") -> list[str]:
+    if AUTO_FETCH_TICKERS:
+        return fetch_auto_tickers()
+
     if not os.path.exists(filepath):
         return []
     with open(filepath, "r", encoding="utf-8") as f:
